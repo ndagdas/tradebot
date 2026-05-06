@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # ============================================================
 #  BOT.PY  —  Binance Futures Long Bot
 #  Platform   : Heroku
@@ -221,12 +221,15 @@ def open_long(client, token, chat, testnet, api_key,
             )
 
         # ── STOP: kalan %20 trail için ─────────────────────────
-        if stop > 0:
+        # Testnet STOP_MARKET desteklemiyor, gerçek hesapta gönder
+        if stop > 0 and not testnet:
             client.new_order(
                 symbol=symbol, side="SELL", type="STOP_MARKET",
                 stopPrice=round(stop, pp), closePosition="true",
-                timeInForce="GTE_GTC" + 3
+                timeInForce="GTE_GTC"
             )
+        elif stop > 0 and testnet:
+            log.info(f"[TESTNET] İlk STOP emri atlandı: {symbol} @ {stop}")
 
         qty_trail = floor_qty(qty_after_tp2 - qty_tp3, q)
         log.info(
@@ -260,12 +263,16 @@ def open_long(client, token, chat, testnet, api_key,
         tg(token, chat, f"❌ <b>{symbol} LONG açılamadı</b>\n🔍 {e}")
 
 # ── STOP GÜNCELLE ────────────────────────────────────────────
-def update_stop_order(client, symbol, new_stop_price: float, info: dict):
+def update_stop_order(client, symbol, new_stop_price: float, info: dict, testnet: bool = False):
     """
     Mevcut STOP_MARKET emrini iptal et, yeni fiyatla tekrar koy.
-    closePosition=true yerine pozisyon miktarı kullanılır.
-    (Testnet -4120 hatasını önler)
+    Testnet STOP_MARKET emrini standart endpoint'te desteklemiyor (-4120).
+    Testnet'te sadece loglanır, gerçek hesapta emir gönderilir.
     """
+    if testnet:
+        log.info(f"[TESTNET] Stop güncelleme atlandı (testnet -4120): {symbol} @ {new_stop_price}")
+        return
+
     # Önce bekleyen STOP emirlerini iptal et
     try:
         orders = client.get_orders(symbol=symbol)
@@ -297,12 +304,12 @@ def update_stop_order(client, symbol, new_stop_price: float, info: dict):
         log.error(f"Yeni stop koyulamadı [{symbol}]: {e}")
 
 # ── TP1 ──────────────────────────────────────────────────────
-def handle_tp1(client, token, chat, symbol, new_stop: float = 0):
+def handle_tp1(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
     rem = float(pos["positionAmt"]) if pos else 0
     if new_stop > 0 and pos:
         try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol))
+            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
         except Exception as e:
             log.error(f"TP1 stop güncelleme [{symbol}]: {e}")
     tg(token, chat,
@@ -314,12 +321,12 @@ def handle_tp1(client, token, chat, symbol, new_stop: float = 0):
     )
 
 # ── TP2 ──────────────────────────────────────────────────────
-def handle_tp2(client, token, chat, symbol, new_stop: float = 0):
+def handle_tp2(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
     rem = float(pos["positionAmt"]) if pos else 0
     if new_stop > 0 and pos:
         try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol))
+            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
         except Exception as e:
             log.error(f"TP2 stop güncelleme [{symbol}]: {e}")
     tg(token, chat,
@@ -331,12 +338,12 @@ def handle_tp2(client, token, chat, symbol, new_stop: float = 0):
     )
 
 # ── TP3 ──────────────────────────────────────────────────────
-def handle_tp3(client, token, chat, symbol, new_stop: float = 0):
+def handle_tp3(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
     rem = float(pos["positionAmt"]) if pos else 0
     if new_stop > 0 and pos:
         try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol))
+            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
         except Exception as e:
             log.error(f"TP3 trail stop [{symbol}]: {e}")
     tg(token, chat,
@@ -435,13 +442,13 @@ def webhook():
             )
         elif action == "tp1":
             handle_tp1(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"))
+                       new_stop=fval(data, "new_stop"), testnet=testnet)
         elif action == "tp2":
             handle_tp2(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"))
+                       new_stop=fval(data, "new_stop"), testnet=testnet)
         elif action == "tp3":
             handle_tp3(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"))
+                       new_stop=fval(data, "new_stop"), testnet=testnet)
         elif action == "trail_update":
             handle_trail_update(client, tg_token, tg_chat, symbol,
                                 new_stop=fval(data, "new_stop"))
