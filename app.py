@@ -186,39 +186,66 @@ def open_long(client, token, chat, testnet, api_key,
         if info["min_qty"] and qty < info["min_qty"]:
             raise ValueError(f"Min lot altında: {qty} < {info['min_qty']}")
 
+        pp     = info["prc"]
+        q      = info["qty"]
+        maxq   = info["max_qty"]
+
+        def safe_qty(val):
+            """Lot değerini max_qty ile kırp, min_qty'nin altındaysa 0 döndür."""
+            v = floor_qty(val, q)
+            if maxq and v > maxq:
+                v = floor_qty(maxq, q)
+            if info["min_qty"] and v < info["min_qty"]:
+                return 0.0
+            return v
+
         # Market emri
         client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=qty)
-        pp = info["prc"]
-        q  = info["qty"]
+        log.info(f"Market emri açıldı: {symbol} {qty} lot")
 
-        # ── TP1: %25 ──────────────────────────────────────────
-        qty_tp1  = floor_qty(qty * TP1_RATIO, q)
-        if tp1 > 0 and qty_tp1 > 0:
-            client.new_order(
-                symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                stopPrice=round(tp1, pp), quantity=qty_tp1,
-                timeInForce="GTE_GTC", reduceOnly="true"
-            )
-
-        # ── TP2: %30 (kalanın %40'ı) ──────────────────────────
+        qty_tp1       = safe_qty(qty * TP1_RATIO)
         qty_after_tp1 = floor_qty(qty - qty_tp1, q)
-        qty_tp2       = floor_qty(qty_after_tp1 * TP2_RATIO, q)
-        if tp2 > 0 and qty_tp2 > 0:
-            client.new_order(
-                symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                stopPrice=round(tp2, pp), quantity=qty_tp2,
-                timeInForce="GTE_GTC", reduceOnly="true"
-            )
-
-        # ── TP3: %25 (kalanın %55.6'sı) ───────────────────────
+        qty_tp2       = safe_qty(qty_after_tp1 * TP2_RATIO)
         qty_after_tp2 = floor_qty(qty_after_tp1 - qty_tp2, q)
-        qty_tp3       = floor_qty(qty_after_tp2 * TP3_RATIO, q)
-        if tp3 > 0 and qty_tp3 > 0:
-            client.new_order(
-                symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                stopPrice=round(tp3, pp), quantity=qty_tp3,
-                timeInForce="GTE_GTC", reduceOnly="true"
-            )
+        qty_tp3       = safe_qty(qty_after_tp2 * TP3_RATIO)
+
+        if testnet:
+            # Testnet'te TAKE_PROFIT_MARKET desteklenmiyor.
+            # Pine TP1/TP2/TP3 sinyali gönderince bot market satış yapacak.
+            log.info(f"[TESTNET] TP emirleri atlandı, Pine sinyali ile satılacak: {symbol}")
+        else:
+            # ── TP1: %25 ──────────────────────────────────────────
+            if tp1 > 0 and qty_tp1 > 0:
+                try:
+                    client.new_order(
+                        symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                        stopPrice=round(tp1, pp), quantity=qty_tp1,
+                        timeInForce="GTE_GTC", reduceOnly="true"
+                    )
+                except Exception as e:
+                    log.error(f"TP1 emri hatası [{symbol}]: {e}")
+
+            # ── TP2: %30 (kalanın %40'ı) ──────────────────────────
+            if tp2 > 0 and qty_tp2 > 0:
+                try:
+                    client.new_order(
+                        symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                        stopPrice=round(tp2, pp), quantity=qty_tp2,
+                        timeInForce="GTE_GTC", reduceOnly="true"
+                    )
+                except Exception as e:
+                    log.error(f"TP2 emri hatası [{symbol}]: {e}")
+
+            # ── TP3: %25 (kalanın %55.6'sı) ───────────────────────
+            if tp3 > 0 and qty_tp3 > 0:
+                try:
+                    client.new_order(
+                        symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                        stopPrice=round(tp3, pp), quantity=qty_tp3,
+                        timeInForce="GTE_GTC", reduceOnly="true"
+                    )
+                except Exception as e:
+                    log.error(f"TP3 emri hatası [{symbol}]: {e}")
 
         # ── STOP: kalan %20 trail için ─────────────────────────
         # Testnet STOP_MARKET desteklemiyor, gerçek hesapta gönder
@@ -303,19 +330,59 @@ def update_stop_order(client, symbol, new_stop_price: float, info: dict, testnet
     except Exception as e:
         log.error(f"Yeni stop koyulamadı [{symbol}]: {e}")
 
+# ── Yardımcı: Pozisyonun belirli oranını market ile sat ──────
+def market_sell_ratio(client, symbol, ratio: float, info: dict) -> float:
+    """
+    Açık pozisyonun ratio kadarını market emriyle sat.
+    Satılan lot miktarını döndürür, hata olursa 0.
+    """
+    pos = open_position(client, symbol)
+    if not pos:
+        log.info(f"Satış atlandı: {symbol} pozisyon yok")
+        return 0.0
+    total = float(pos["positionAmt"])
+    qty   = floor_qty(total * ratio, info["qty"])
+    if info["max_qty"] and qty > info["max_qty"]:
+        qty = floor_qty(info["max_qty"], info["qty"])
+    if not qty or qty < (info["min_qty"] or 0):
+        log.warning(f"Satış qty çok küçük: {symbol} qty={qty}")
+        return 0.0
+    try:
+        client.new_order(
+            symbol=symbol, side="SELL",
+            type="MARKET", quantity=qty,
+            reduceOnly="true"
+        )
+        log.info(f"Market sat: {symbol} {qty} lot ({ratio*100:.0f}%)")
+        return qty
+    except Exception as e:
+        log.error(f"Market satış hatası [{symbol}]: {e}")
+        return 0.0
+
+
 # ── TP1 ──────────────────────────────────────────────────────
 def handle_tp1(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
-    rem = float(pos["positionAmt"]) if pos else 0
-    if new_stop > 0 and pos:
-        try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
-        except Exception as e:
-            log.error(f"TP1 stop güncelleme [{symbol}]: {e}")
+    if not pos:
+        tg(token, chat, f"⚠️ <b>{symbol} TP1</b> — Pozisyon bulunamadı")
+        return
+
+    info = get_symbol_info(client, symbol)
+
+    # %25 market ile sat
+    sold = market_sell_ratio(client, symbol, TP1_RATIO, info)
+
+    # Stop BE'ye çek (gerçek hesapta)
+    if new_stop > 0:
+        update_stop_order(client, symbol, new_stop, info, testnet)
+
+    pos_after = open_position(client, symbol)
+    rem = float(pos_after["positionAmt"]) if pos_after else 0
+
     tg(token, chat,
        f"🎯 <b>{symbol} TP1 HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>%25</b> kapatıldı\n"
+       f"✅ <b>{sold} lot (%25)</b> satıldı\n"
        f"📦 Kalan: <b>{rem} lot</b>\n"
        f"🔒 Stop BE'ye çekildi: <b>{new_stop}</b>"
     )
@@ -323,16 +390,25 @@ def handle_tp1(client, token, chat, symbol, new_stop: float = 0, testnet: bool =
 # ── TP2 ──────────────────────────────────────────────────────
 def handle_tp2(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
-    rem = float(pos["positionAmt"]) if pos else 0
-    if new_stop > 0 and pos:
-        try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
-        except Exception as e:
-            log.error(f"TP2 stop güncelleme [{symbol}]: {e}")
+    if not pos:
+        tg(token, chat, f"⚠️ <b>{symbol} TP2</b> — Pozisyon bulunamadı")
+        return
+
+    info = get_symbol_info(client, symbol)
+
+    # Kalan pozisyonun %40'ını sat (toplam %30)
+    sold = market_sell_ratio(client, symbol, TP2_RATIO, info)
+
+    if new_stop > 0:
+        update_stop_order(client, symbol, new_stop, info, testnet)
+
+    pos_after = open_position(client, symbol)
+    rem = float(pos_after["positionAmt"]) if pos_after else 0
+
     tg(token, chat,
        f"🎯 <b>{symbol} TP2 HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>%30</b> kapatıldı\n"
+       f"✅ <b>{sold} lot (%30)</b> satıldı\n"
        f"📦 Kalan: <b>{rem} lot</b>\n"
        f"🔒 Stop TP1 seviyesine çekildi: <b>{new_stop}</b>"
     )
@@ -340,16 +416,25 @@ def handle_tp2(client, token, chat, symbol, new_stop: float = 0, testnet: bool =
 # ── TP3 ──────────────────────────────────────────────────────
 def handle_tp3(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
     pos = open_position(client, symbol)
-    rem = float(pos["positionAmt"]) if pos else 0
-    if new_stop > 0 and pos:
-        try:
-            update_stop_order(client, symbol, new_stop, get_symbol_info(client, symbol), testnet)
-        except Exception as e:
-            log.error(f"TP3 trail stop [{symbol}]: {e}")
+    if not pos:
+        tg(token, chat, f"⚠️ <b>{symbol} TP3</b> — Pozisyon bulunamadı")
+        return
+
+    info = get_symbol_info(client, symbol)
+
+    # Kalan pozisyonun %55.6'sını sat (toplam %25)
+    sold = market_sell_ratio(client, symbol, TP3_RATIO, info)
+
+    if new_stop > 0:
+        update_stop_order(client, symbol, new_stop, info, testnet)
+
+    pos_after = open_position(client, symbol)
+    rem = float(pos_after["positionAmt"]) if pos_after else 0
+
     tg(token, chat,
        f"🎯 <b>{symbol} TP3 HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>%25</b> kapatıldı\n"
+       f"✅ <b>{sold} lot (%25)</b> satıldı\n"
        f"📦 Kalan: <b>{rem} lot (trail)</b>\n"
        f"🔄 Trailing stop aktif: <b>{new_stop}</b>"
     )
@@ -414,6 +499,13 @@ def webhook():
         tg_token   = sval(data, "tg_token",   "telegramBotToken")
         tg_chat    = sval(data, "tg_chat_id", "telegramChatId")
         testnet    = sval(data, "testnet", default="true").lower() == "true"
+
+        # ── Webhook Secret doğrulama ──────────────────────────
+        expected_secret = os.environ.get("WEBHOOK_SECRET", "")
+        incoming_secret = sval(data, "webhookSecret", "webhook_secret")
+        if expected_secret and incoming_secret != expected_secret:
+            log.warning(f"Geçersiz webhook secret!")
+            return jsonify({"error": "Unauthorized"}), 401
 
         missing = []
         if not action:     missing.append("action/side")
