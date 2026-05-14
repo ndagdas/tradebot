@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================
-#  BOT.PY  —  Binance Futures Long Bot  (HEDGE MODE)
+#  BOT.PY  —  Binance Futures Long + Short Bot (HEDGE MODE)
 #  Platform   : Heroku
 #  TP Sistemi : 25% / 30% / 25% / 20% trail
 #  NOT        : Binance Hedge Mode açık olmalı
-#               Tüm emirlerde positionSide="LONG" gönderilir
+#               Long  → positionSide="LONG"
+#               Short → positionSide="SHORT"
+#               Tek webhook endpoint — yön side/action'dan okunur
 # ============================================================
 
 import logging
@@ -25,8 +27,9 @@ log = logging.getLogger(__name__)
 
 PORT = int(os.environ.get("PORT", 5000))
 
+# ── Lot Dağılımı ─────────────────────────────────────────────
 TP1_RATIO = 0.25
-TP2_RATIO = round(30 / 75, 6)   # 0.4
+TP2_RATIO = round(30 / 75, 6)   # 0.4000
 TP3_RATIO = round(25 / 45, 6)   # 0.5556
 
 # ── Binance ─────────────────────────────────────────────────
@@ -71,38 +74,77 @@ def sval(data: dict, *keys, default="") -> str:
             return str(v).strip()
     return str(default)
 
-def parse_action(data: dict) -> str:
-    action = str(data.get("action", "")).strip().lower()
-    if action in ("buy", "tp1", "tp2", "tp3", "stop", "trail_update"):
-        return action
-    side = str(data.get("side", "")).strip().lower()
-    side_map = {
-        "buy"  : "buy",  "long"         : "buy",
-        "sell" : "stop", "short"        : "stop",
-        "stop" : "stop", "close"        : "stop",
-        "tp1"  : "tp1",  "take_profit1" : "tp1",
-        "tp2"  : "tp2",  "take_profit2" : "tp2",
-        "tp3"  : "tp3",  "take_profit3" : "tp3",
-        "trail_update": "trail_update",
+def parse_signal(data: dict) -> tuple[str, str]:
+    """
+    (action, direction) döndürür.
+    action    : "open" | "tp1" | "tp2" | "tp3" | "stop"
+    direction : "LONG" | "SHORT"
+
+    Pine Script'ten gelen side değerleri:
+      LONG  giriş  → side="BUY"       | action="buy"
+      SHORT giriş  → side="SELL"      | action="sell"
+      LONG  TP1    → side="TP1"       | action="tp1"
+      SHORT TP1    → side="SHORT_TP1" | action="tp1"
+      LONG  TP2    → side="TP2"       | action="tp2"
+      SHORT TP2    → side="SHORT_TP2" | action="tp2"
+      LONG  TP3    → side="TP3"       | action="tp3"
+      SHORT TP3    → side="SHORT_TP3" | action="tp3"
+      LONG  Stop   → side="STOP"      | action="stop"
+      SHORT Stop   → side="SHORT_STOP"| action="stop"
+    """
+    action_raw = str(data.get("action", "")).strip().lower()
+    side_raw   = str(data.get("side",   "")).strip().lower()
+
+    # ── Yön belirle ──────────────────────────────────────────
+    short_keywords = ("sell", "short", "short_tp1", "short_tp2",
+                      "short_tp3", "short_stop")
+    long_keywords  = ("buy", "long", "tp1", "tp2", "tp3",
+                      "stop", "trail_update")
+
+    if side_raw.startswith("short") or action_raw in ("sell", "short"):
+        direction = "SHORT"
+    else:
+        direction = "LONG"
+
+    # ── Action belirle ───────────────────────────────────────
+    action_map = {
+        # Long girişler
+        "buy"        : "open",
+        # Short girişler
+        "sell"       : "open",
+        "short"      : "open",
+        # TP'ler
+        "tp1"        : "tp1",
+        "short_tp1"  : "tp1",
+        "tp2"        : "tp2",
+        "short_tp2"  : "tp2",
+        "tp3"        : "tp3",
+        "short_tp3"  : "tp3",
+        # Stop / Trail
+        "stop"       : "stop",
+        "short_stop" : "stop",
+        "trail_exit" : "stop",
+        "trail_update": "trail",
+        # Eski format uyumu
+        "take_profit1": "tp1",
+        "take_profit2": "tp2",
+        "take_profit3": "tp3",
+        "close"      : "stop",
     }
-    if side in side_map:
-        exit_type = str(data.get("exitType", "")).strip().lower()
-        exit_map  = {
-            "tp1_exit"   : "tp1",
-            "tp2_exit"   : "tp2",
-            "tp3_exit"   : "tp3",
-            "trail_exit" : "stop",
-        }
-        if exit_type in exit_map:
-            return exit_map[exit_type]
-        return side_map[side]
-    return action
+
+    # Önce side'a bak, sonra action'a
+    action = action_map.get(side_raw) or action_map.get(action_raw, "")
+
+    log.info(f"parse_signal: action_raw={action_raw} side_raw={side_raw} "
+             f"→ action={action} direction={direction}")
+    return action, direction
 
 # ── Exchange Cache ───────────────────────────────────────────
 _exchange_cache: dict = {}
 CACHE_TTL = 300
 
-def get_exchange_info(client: UMFutures, api_key: str, force_refresh: bool = False) -> dict:
+def get_exchange_info(client: UMFutures, api_key: str,
+                      force_refresh: bool = False) -> dict:
     import time
     now    = time.time()
     cached = _exchange_cache.get(api_key)
@@ -114,7 +156,7 @@ def get_exchange_info(client: UMFutures, api_key: str, force_refresh: bool = Fal
     _exchange_cache[api_key] = {"data": data, "ts": now}
     return data
 
-def _parse_symbol(s: dict) -> dict:
+def _parse_symbol_info(s: dict) -> dict:
     max_qty = min_qty = None
     for f in s.get("filters", []):
         if f["filterType"] == "LOT_SIZE":
@@ -132,13 +174,12 @@ def get_symbol_info(client: UMFutures, symbol: str, api_key: str = "") -> dict:
     info = get_exchange_info(client, api_key)
     for s in info["symbols"]:
         if s["symbol"] == symbol:
-            return _parse_symbol(s)
-    log.warning(f"{symbol} cache'de yok, taze çekiliyor...")
+            return _parse_symbol_info(s)
     info = get_exchange_info(client, api_key, force_refresh=True)
     for s in info["symbols"]:
         if s["symbol"] == symbol:
-            return _parse_symbol(s)
-    raise ValueError(f"Binance Futures'da sembol bulunamadı: {symbol}")
+            return _parse_symbol_info(s)
+    raise ValueError(f"Sembol bulunamadı: {symbol}")
 
 def floor_qty(val: float, precision: int) -> float:
     f = 10 ** precision
@@ -147,85 +188,116 @@ def floor_qty(val: float, precision: int) -> float:
 def mark_price(client: UMFutures, symbol: str) -> float:
     return float(client.mark_price(symbol=symbol)["markPrice"])
 
-def open_long_position(client: UMFutures, symbol: str):
-    """Hedge Mode: positionSide == 'LONG' olan açık pozisyonu döndür."""
+# ── Pozisyon Sorgula ────────────────────────────────────────
+def get_position(client: UMFutures, symbol: str, direction: str):
+    """
+    Hedge Mode'da verilen yöndeki açık pozisyonu döndürür.
+    direction: "LONG" veya "SHORT"
+    positionAmt: her iki yönde de pozitif gelir.
+    """
     for p in client.get_position_risk(symbol=symbol):
-        if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0:
+        if (p.get("positionSide") == direction and
+                float(p.get("positionAmt", 0)) > 0):
             return p
     return None
 
-# ── STOP GÜNCELLE ────────────────────────────────────────────
+# ── Lot Yardımcısı ──────────────────────────────────────────
+def safe_qty(val: float, info: dict) -> float:
+    v = floor_qty(val, info["qty"])
+    if info["max_qty"] and v > info["max_qty"]:
+        v = floor_qty(info["max_qty"], info["qty"])
+    if info["min_qty"] and v < info["min_qty"]:
+        return 0.0
+    return v
+
+# ── Kısmi Kapatma ───────────────────────────────────────────
+def market_close_ratio(client: UMFutures, symbol: str,
+                       ratio: float, info: dict, direction: str) -> float:
+    """
+    Açık pozisyonun ratio kadarını kapatır.
+    LONG  → SELL market
+    SHORT → BUY  market
+    """
+    pos = get_position(client, symbol, direction)
+    if not pos:
+        log.info(f"Kapatma atlandı: {symbol} {direction} pozisyon yok")
+        return 0.0
+
+    total = float(pos["positionAmt"])
+    qty   = safe_qty(total * ratio, info)
+    if qty <= 0:
+        log.warning(f"Kapatma qty küçük: {symbol} qty={qty}")
+        return 0.0
+
+    close_side = "SELL" if direction == "LONG" else "BUY"
+    try:
+        client.new_order(
+            symbol=symbol, side=close_side,
+            type="MARKET", quantity=qty,
+            reduceOnly="true",
+            positionSide=direction
+        )
+        log.info(f"{direction} kısmi kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
+        return qty
+    except Exception as e:
+        log.error(f"Kısmi kapatma hatası [{symbol} {direction}]: {e}")
+        return 0.0
+
+# ── Stop Güncelle ────────────────────────────────────────────
 def update_stop_order(client: UMFutures, symbol: str,
-                      new_stop_price: float, info: dict, testnet: bool = False):
+                      new_stop: float, info: dict,
+                      direction: str, testnet: bool = False):
     if testnet:
-        log.info(f"[TESTNET] Stop güncelleme atlandı (-4120): {symbol} @ {new_stop_price}")
+        log.info(f"[TESTNET] Stop güncelleme atlandı: {symbol} @ {new_stop}")
         return
 
-    # Sadece LONG'a ait STOP_MARKET emirlerini iptal et
+    # Mevcut STOP_MARKET emirlerini iptal et (sadece aynı yön)
     try:
-        orders = client.get_orders(symbol=symbol)
-        for o in orders:
+        for o in client.get_orders(symbol=symbol):
             if (o.get("status") == "NEW" and
                 o.get("type") == "STOP_MARKET" and
-                o.get("positionSide") == "LONG"):
+                o.get("positionSide") == direction):
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
-                log.info(f"Eski LONG STOP iptal: {o['orderId']}")
+                log.info(f"Eski {direction} STOP iptal: {o['orderId']}")
     except Exception as e:
-        log.warning(f"Stop iptali [{symbol}]: {e}")
+        log.warning(f"Stop iptali [{symbol} {direction}]: {e}")
 
-    pos = open_long_position(client, symbol)
+    pos = get_position(client, symbol, direction)
     if not pos:
-        log.info(f"Stop güncelleme atlandı: {symbol} LONG pozisyon kapalı")
         return
 
     try:
-        pp  = info["prc"]
-        qty = float(pos["positionAmt"])
+        pp         = info["prc"]
+        qty        = float(pos["positionAmt"])
+        close_side = "SELL" if direction == "LONG" else "BUY"
+
         client.new_order(
-            symbol=symbol, side="SELL", type="STOP_MARKET",
-            stopPrice=round(new_stop_price, pp),
+            symbol=symbol, side=close_side, type="STOP_MARKET",
+            stopPrice=round(new_stop, pp),
             quantity=qty,
             timeInForce="GTE_GTC",
             reduceOnly="true",
-            positionSide="LONG"         # ← Hedge Mode zorunlu
+            positionSide=direction
         )
-        log.info(f"Yeni LONG STOP: {symbol} @ {round(new_stop_price, pp)} qty={qty}")
+        log.info(f"Yeni {direction} STOP: {symbol} @ {round(new_stop, pp)}")
     except Exception as e:
-        log.error(f"Yeni stop koyulamadı [{symbol}]: {e}")
+        log.error(f"Stop koyulamadı [{symbol} {direction}]: {e}")
 
-# ── Kısmi Satış ─────────────────────────────────────────────
-def market_sell_ratio(client: UMFutures, symbol: str,
-                      ratio: float, info: dict) -> float:
-    pos = open_long_position(client, symbol)
-    if not pos:
-        log.info(f"Satış atlandı: {symbol} LONG pozisyon yok")
-        return 0.0
-    total = float(pos["positionAmt"])
-    qty   = floor_qty(total * ratio, info["qty"])
-    if info["max_qty"] and qty > info["max_qty"]:
-        qty = floor_qty(info["max_qty"], info["qty"])
-    if not qty or qty < (info["min_qty"] or 0):
-        log.warning(f"Satış qty çok küçük: {symbol} qty={qty}")
-        return 0.0
+# ════════════════════════════════════════════════════════════
+#  LONG / SHORT AÇ
+# ════════════════════════════════════════════════════════════
+def open_position(client, token, chat, testnet, api_key,
+                  symbol, usdt, leverage, tp1, tp2, tp3, stop,
+                  direction: str):
+    """
+    direction = "LONG"  → BUY market + SELL TP/STOP emirleri
+    direction = "SHORT" → SELL market + BUY TP/STOP emirleri
+    """
+    emoji = "🟢" if direction == "LONG" else "🔴"
     try:
-        client.new_order(
-            symbol=symbol, side="SELL",
-            type="MARKET", quantity=qty,
-            reduceOnly="true",
-            positionSide="LONG"         # ← Hedge Mode zorunlu
-        )
-        log.info(f"LONG kısmi sat: {symbol} {qty} lot ({ratio*100:.0f}%)")
-        return qty
-    except Exception as e:
-        log.error(f"Market satış hatası [{symbol}]: {e}")
-        return 0.0
-
-# ── LONG AÇ ─────────────────────────────────────────────────
-def open_long(client, token, chat, testnet, api_key,
-              symbol, usdt, leverage, tp1, tp2, tp3, stop):
-    try:
-        if open_long_position(client, symbol):
-            tg(token, chat, f"⚠️ <b>{symbol}</b>\nAçık LONG var, sinyal atlandı.")
+        if get_position(client, symbol, direction):
+            tg(token, chat,
+               f"⚠️ <b>{symbol}</b>\nAçık {direction} var, sinyal atlandı.")
             return
 
         try:
@@ -238,107 +310,84 @@ def open_long(client, token, chat, testnet, api_key,
         notional = usdt * leverage
         qty      = floor_qty(notional / price, info["qty"])
 
-        log.info(f"Hesap: {usdt}×{leverage}={notional} USDT | Fiyat:{price} | Lot:{qty}")
+        log.info(f"{direction} | {symbol} | "
+                 f"{usdt}×{leverage}={notional} USDT | fiyat={price} | lot={qty}")
 
         if qty <= 0:
             raise ValueError(f"Lot sıfır — fiyat:{price} notional:{notional}")
         if info["max_qty"] and qty > info["max_qty"]:
-            log.warning(f"Max lot kırpıldı: {qty} → {info['max_qty']}")
             qty = floor_qty(info["max_qty"], info["qty"])
         if info["min_qty"] and qty < info["min_qty"]:
             raise ValueError(f"Min lot altında: {qty} < {info['min_qty']}")
 
-        pp   = info["prc"]
-        q    = info["qty"]
-        maxq = info["max_qty"]
+        pp          = info["prc"]
+        q           = info["qty"]
+        entry_side  = "BUY"  if direction == "LONG" else "SELL"
+        close_side  = "SELL" if direction == "LONG" else "BUY"
 
-        def safe_qty(val):
-            v = floor_qty(val, q)
-            if maxq and v > maxq:
-                v = floor_qty(maxq, q)
-            if info["min_qty"] and v < info["min_qty"]:
-                return 0.0
-            return v
-
-        # ── Market LONG emri (Hedge Mode: positionSide=LONG) ──
+        # ── Market emri ───────────────────────────────────────
         client.new_order(
-            symbol=symbol, side="BUY",
+            symbol=symbol, side=entry_side,
             type="MARKET", quantity=qty,
-            positionSide="LONG"         # ← Hedge Mode zorunlu
+            positionSide=direction
         )
-        log.info(f"Market emri açıldı: {symbol} {qty} lot")
+        log.info(f"{direction} açıldı: {symbol} {qty} lot x{leverage}")
 
-        qty_tp1       = safe_qty(qty * TP1_RATIO)
+        # ── Lot hesapları ─────────────────────────────────────
+        qty_tp1       = safe_qty(qty * TP1_RATIO, info)
         qty_after_tp1 = floor_qty(qty - qty_tp1, q)
-        qty_tp2       = safe_qty(qty_after_tp1 * TP2_RATIO)
+        qty_tp2       = safe_qty(qty_after_tp1 * TP2_RATIO, info)
         qty_after_tp2 = floor_qty(qty_after_tp1 - qty_tp2, q)
-        qty_tp3       = safe_qty(qty_after_tp2 * TP3_RATIO)
+        qty_tp3       = safe_qty(qty_after_tp2 * TP3_RATIO, info)
         qty_trail     = floor_qty(qty_after_tp2 - qty_tp3, q)
 
         if testnet:
-            log.info(f"[TESTNET] TP emirleri atlandı, Pine sinyali ile satılacak: {symbol}")
+            log.info(f"[TESTNET] TP emirleri atlandı: {symbol}")
         else:
-            # ── TP1: %25 ──────────────────────────────────────
-            if tp1 > 0 and qty_tp1 > 0:
+            # ── TP emirleri ───────────────────────────────────
+            for tp_price, tp_qty, tp_name in [
+                (tp1, qty_tp1, "TP1"),
+                (tp2, qty_tp2, "TP2"),
+                (tp3, qty_tp3, "TP3"),
+            ]:
+                if tp_price > 0 and tp_qty > 0:
+                    try:
+                        client.new_order(
+                            symbol=symbol, side=close_side,
+                            type="TAKE_PROFIT_MARKET",
+                            stopPrice=round(tp_price, pp),
+                            quantity=tp_qty,
+                            timeInForce="GTE_GTC",
+                            reduceOnly="true",
+                            positionSide=direction
+                        )
+                    except Exception as e:
+                        log.error(f"{tp_name} emri [{symbol} {direction}]: {e}")
+
+            # ── İlk Stop emri ─────────────────────────────────
+            # closePosition Hedge Mode'da yasak → quantity kullan
+            if stop > 0:
                 try:
                     client.new_order(
-                        symbol=symbol, side="SELL",
-                        type="TAKE_PROFIT_MARKET",
-                        stopPrice=round(tp1, pp), quantity=qty_tp1,
-                        timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="LONG"     # ← Hedge Mode zorunlu
+                        symbol=symbol, side=close_side, type="STOP_MARKET",
+                        stopPrice=round(stop, pp),
+                        quantity=qty,
+                        timeInForce="GTE_GTC",
+                        reduceOnly="true",
+                        positionSide=direction
                     )
                 except Exception as e:
-                    log.error(f"TP1 emri [{symbol}]: {e}")
+                    log.error(f"İlk STOP emri [{symbol} {direction}]: {e}")
 
-            # ── TP2: %30 ──────────────────────────────────────
-            if tp2 > 0 and qty_tp2 > 0:
-                try:
-                    client.new_order(
-                        symbol=symbol, side="SELL",
-                        type="TAKE_PROFIT_MARKET",
-                        stopPrice=round(tp2, pp), quantity=qty_tp2,
-                        timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="LONG"     # ← Hedge Mode zorunlu
-                    )
-                except Exception as e:
-                    log.error(f"TP2 emri [{symbol}]: {e}")
-
-            # ── TP3: %25 ──────────────────────────────────────
-            if tp3 > 0 and qty_tp3 > 0:
-                try:
-                    client.new_order(
-                        symbol=symbol, side="SELL",
-                        type="TAKE_PROFIT_MARKET",
-                        stopPrice=round(tp3, pp), quantity=qty_tp3,
-                        timeInForce="GTE_GTC", reduceOnly="true",
-                        positionSide="LONG"     # ← Hedge Mode zorunlu
-                    )
-                except Exception as e:
-                    log.error(f"TP3 emri [{symbol}]: {e}")
-
-        # ── STOP ──────────────────────────────────────────────
-        if stop > 0 and not testnet:
-            client.new_order(
-                symbol=symbol, side="SELL", type="STOP_MARKET",
-                stopPrice=round(stop, pp), closePosition="true",
-                timeInForce="GTE_GTC",
-                positionSide="LONG"             # ← Hedge Mode zorunlu
-            )
         elif stop > 0 and testnet:
-            log.info(f"[TESTNET] İlk STOP emri atlandı: {symbol} @ {stop}")
+            log.info(f"[TESTNET] STOP atlandı: {symbol} @ {stop}")
 
-        log.info(
-            f"LONG açıldı: {symbol} {qty} lot x{leverage}\n"
-            f"  TP1={tp1} ({qty_tp1} lot) | TP2={tp2} ({qty_tp2} lot) | "
-            f"TP3={tp3} ({qty_tp3} lot) | Trail={qty_trail} lot | Stop={stop}"
-        )
         tg(token, chat,
-           f"🟢 <b>{symbol} LONG AÇILDI</b> [Hedge Mode]\n"
+           f"{emoji} <b>{symbol} {direction} AÇILDI</b> [Hedge Mode]\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"💰 Teminat : <b>{usdt} USDT</b>\n"
            f"⚡ Kaldıraç: <b>x{leverage}</b>\n"
-           f"📊 Notional: <b>{round(notional,2)} USDT</b>\n"
+           f"📊 Notional: <b>{round(notional, 2)} USDT</b>\n"
            f"📦 Toplam  : <b>{qty} lot</b>\n"
            f"💵 Giriş   : <b>{price}</b>\n"
            f"━━━━━━━━━━━━━━━━━\n"
@@ -351,108 +400,85 @@ def open_long(client, token, chat, testnet, api_key,
         )
 
     except ValueError as e:
-        log.error(f"open_long [{symbol}]: {e}")
-        tg(token, chat, f"❌ <b>{symbol} LONG açılamadı</b>\n🔍 {e}")
+        log.error(f"open_position [{symbol} {direction}]: {e}")
+        tg(token, chat,
+           f"❌ <b>{symbol} {direction} açılamadı</b>\n🔍 {e}")
     except Exception as e:
-        log.error(f"open_long [{symbol}]: {e}")
-        tg(token, chat, f"❌ <b>{symbol} LONG açılamadı</b>\n🔍 {e}")
+        log.error(f"open_position [{symbol} {direction}]: {e}")
+        tg(token, chat,
+           f"❌ <b>{symbol} {direction} açılamadı</b>\n🔍 {e}")
 
-# ── TP1 ──────────────────────────────────────────────────────
-def handle_tp1(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
-    pos = open_long_position(client, symbol)
+# ════════════════════════════════════════════════════════════
+#  TP1 / TP2 / TP3
+# ════════════════════════════════════════════════════════════
+def handle_tp(client, token, chat, symbol, tp_num: int,
+              new_stop: float, direction: str, testnet: bool,
+              ratio: float, pct_label: str):
+    pos = get_position(client, symbol, direction)
     if not pos:
-        tg(token, chat, f"⚠️ <b>{symbol} TP1</b> — LONG pozisyon bulunamadı")
+        tg(token, chat,
+           f"⚠️ <b>{symbol} TP{tp_num}</b> — {direction} pozisyon bulunamadı")
         return
+
     info = get_symbol_info(client, symbol)
-    sold = market_sell_ratio(client, symbol, TP1_RATIO, info)
+    sold = market_close_ratio(client, symbol, ratio, info, direction)
+
     if new_stop > 0:
-        update_stop_order(client, symbol, new_stop, info, testnet)
-    pos_after = open_long_position(client, symbol)
+        update_stop_order(client, symbol, new_stop, info, direction, testnet)
+
+    pos_after = get_position(client, symbol, direction)
     rem = float(pos_after["positionAmt"]) if pos_after else 0
+
+    emoji = "🟢" if direction == "LONG" else "🔴"
     tg(token, chat,
-       f"🎯 <b>{symbol} TP1 HİT</b>\n"
+       f"🎯 <b>{symbol} {direction} TP{tp_num} HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>{sold} lot (%25)</b> satıldı\n"
+       f"✅ <b>{sold} lot ({pct_label})</b> kapatıldı\n"
        f"📦 Kalan: <b>{rem} lot</b>\n"
-       f"🔒 Stop BE'ye çekildi: <b>{new_stop}</b>"
+       f"🔒 Stop güncellendi: <b>{new_stop}</b>"
     )
 
-# ── TP2 ──────────────────────────────────────────────────────
-def handle_tp2(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
-    pos = open_long_position(client, symbol)
-    if not pos:
-        tg(token, chat, f"⚠️ <b>{symbol} TP2</b> — LONG pozisyon bulunamadı")
-        return
-    info = get_symbol_info(client, symbol)
-    sold = market_sell_ratio(client, symbol, TP2_RATIO, info)
-    if new_stop > 0:
-        update_stop_order(client, symbol, new_stop, info, testnet)
-    pos_after = open_long_position(client, symbol)
-    rem = float(pos_after["positionAmt"]) if pos_after else 0
-    tg(token, chat,
-       f"🎯 <b>{symbol} TP2 HİT</b>\n"
-       f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>{sold} lot (%30)</b> satıldı\n"
-       f"📦 Kalan: <b>{rem} lot</b>\n"
-       f"🔒 Stop TP1 seviyesine çekildi: <b>{new_stop}</b>"
-    )
-
-# ── TP3 ──────────────────────────────────────────────────────
-def handle_tp3(client, token, chat, symbol, new_stop: float = 0, testnet: bool = False):
-    pos = open_long_position(client, symbol)
-    if not pos:
-        tg(token, chat, f"⚠️ <b>{symbol} TP3</b> — LONG pozisyon bulunamadı")
-        return
-    info = get_symbol_info(client, symbol)
-    sold = market_sell_ratio(client, symbol, TP3_RATIO, info)
-    if new_stop > 0:
-        update_stop_order(client, symbol, new_stop, info, testnet)
-    pos_after = open_long_position(client, symbol)
-    rem = float(pos_after["positionAmt"]) if pos_after else 0
-    tg(token, chat,
-       f"🎯 <b>{symbol} TP3 HİT</b>\n"
-       f"━━━━━━━━━━━━━━━━━\n"
-       f"✅ <b>{sold} lot (%25)</b> satıldı\n"
-       f"📦 Kalan: <b>{rem} lot (trail)</b>\n"
-       f"🔄 Trailing stop aktif: <b>{new_stop}</b>"
-    )
-
-# ── TRAIL UPDATE ─────────────────────────────────────────────
-def handle_trail_update(client, token, chat, symbol, new_stop: float):
-    log.info(f"Trail bilgi: {symbol} @ {new_stop} (Binance emri güncellenmedi)")
-
-# ── STOP ─────────────────────────────────────────────────────
-def handle_stop(client, token, chat, symbol):
+# ════════════════════════════════════════════════════════════
+#  STOP / TRAIL EXIT
+# ════════════════════════════════════════════════════════════
+def handle_stop(client, token, chat, symbol, direction: str):
     cancelled = 0
+    close_side = "SELL" if direction == "LONG" else "BUY"
+
     try:
-        pos = open_long_position(client, symbol)
+        pos = get_position(client, symbol, direction)
         if pos:
             qty = float(pos["positionAmt"])
             client.new_order(
-                symbol=symbol, side="SELL", type="MARKET",
-                quantity=qty, reduceOnly="true",
-                positionSide="LONG"             # ← Hedge Mode zorunlu
+                symbol=symbol, side=close_side,
+                type="MARKET", quantity=qty,
+                reduceOnly="true",
+                positionSide=direction
             )
-            log.info(f"LONG STOP: {symbol} {qty} lot kapatıldı")
+            log.info(f"{direction} STOP: {symbol} {qty} lot kapatıldı")
     except Exception as e:
-        log.warning(f"STOP kapama [{symbol}]: {e}")
+        log.warning(f"{direction} kapama [{symbol}]: {e}")
+
     try:
         for o in client.get_orders(symbol=symbol):
             if (o.get("status") == "NEW" and
                 o.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET") and
-                o.get("positionSide") == "LONG"):
+                o.get("positionSide") == direction):
                 client.cancel_order(symbol=symbol, orderId=o["orderId"])
                 cancelled += 1
     except Exception as e:
-        log.warning(f"Emir iptal [{symbol}]: {e}")
+        log.warning(f"Emir iptal [{symbol} {direction}]: {e}")
+
     extra = f"\n🔧 {cancelled} emir iptal edildi" if cancelled else ""
     tg(token, chat,
-       f"🛑 <b>{symbol} LONG STOP HİT</b>\n"
+       f"🛑 <b>{symbol} {direction} STOP HİT</b>\n"
        f"━━━━━━━━━━━━━━━━━\n"
-       f"❌ Tüm LONG pozisyon kapatıldı{extra}"
+       f"❌ Tüm {direction} pozisyon kapatıldı{extra}"
     )
 
-# ── FLASK ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#  FLASK
+# ════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
 @app.route("/webhook", methods=["POST"])
@@ -466,77 +492,111 @@ def webhook():
             log.error(f"JSON okunamadı: {raw_body[:300]}")
             return jsonify({"error": "Geçersiz JSON"}), 400
 
-        action = parse_action(data)
-        symbol = clean_symbol(sval(data, "symbol", "ticker"))
+        # ── Webhook Secret ────────────────────────────────────
+        expected = os.environ.get("WEBHOOK_SECRET", "")
+        incoming = sval(data, "webhookSecret", "webhook_secret")
+        if expected and incoming != expected:
+            log.warning("Geçersiz webhook secret!")
+            return jsonify({"error": "Unauthorized"}), 401
 
+        # ── Zorunlu alanlar ───────────────────────────────────
         api_key    = sval(data, "api_key",    "binanceApiKey")
         api_secret = sval(data, "api_secret", "binanceSecretKey")
         tg_token   = sval(data, "tg_token",   "telegramBotToken")
         tg_chat    = sval(data, "tg_chat_id", "telegramChatId")
+        symbol     = clean_symbol(sval(data, "symbol", "ticker"))
         testnet    = sval(data, "testnet", default="true").lower() == "true"
 
-        expected_secret = os.environ.get("WEBHOOK_SECRET", "")
-        incoming_secret = sval(data, "webhookSecret", "webhook_secret")
-        if expected_secret and incoming_secret != expected_secret:
-            log.warning("Geçersiz webhook secret!")
-            return jsonify({"error": "Unauthorized"}), 401
-
         missing = []
-        if not action:     missing.append("action/side")
         if not symbol:     missing.append("symbol/ticker")
         if not api_key:    missing.append("api_key/binanceApiKey")
         if not api_secret: missing.append("api_secret/binanceSecretKey")
         if not tg_token:   missing.append("tg_token/telegramBotToken")
         if not tg_chat:    missing.append("tg_chat_id/telegramChatId")
-
         if missing:
-            log.error(f"Eksik: {missing} | Data: {data}")
-            return jsonify({"error": f"Eksik alanlar: {missing}"}), 400
+            return jsonify({"error": f"Eksik: {missing}"}), 400
 
-        log.info(f"▶ LONG {action.upper()} | {symbol} | testnet={testnet}")
+        # ── Yön & Aksiyon ─────────────────────────────────────
+        action, direction = parse_signal(data)
+        if not action:
+            return jsonify({"error": "Bilinmeyen action/side"}), 400
+
+        log.info(f"▶ {direction} {action.upper()} | {symbol} | testnet={testnet}")
         client = get_client(api_key, api_secret, testnet)
 
-        if action == "buy":
-            open_long(
+        # ── Routing ───────────────────────────────────────────
+        if action == "open":
+            open_position(
                 client, tg_token, tg_chat, testnet, api_key, symbol,
-                usdt     = fval(data, "usdt", "quantity"),
-                leverage = int(fval(data, "leverage", default=1)),
-                tp1      = fval(data, "tp1"),
-                tp2      = fval(data, "tp2"),
-                tp3      = fval(data, "tp3"),
-                stop     = fval(data, "stop", "sl", "exitPrice", "stopPrice")
+                usdt      = fval(data, "usdt", "quantity"),
+                leverage  = int(fval(data, "leverage", default=1)),
+                tp1       = fval(data, "tp1"),
+                tp2       = fval(data, "tp2"),
+                tp3       = fval(data, "tp3"),
+                stop      = fval(data, "stop", "sl", "exitPrice", "stopPrice"),
+                direction = direction
             )
+
         elif action == "tp1":
-            handle_tp1(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"), testnet=testnet)
+            handle_tp(client, tg_token, tg_chat, symbol,
+                      tp_num    = 1,
+                      new_stop  = fval(data, "new_stop"),
+                      direction = direction,
+                      testnet   = testnet,
+                      ratio     = TP1_RATIO,
+                      pct_label = "%25")
+
         elif action == "tp2":
-            handle_tp2(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"), testnet=testnet)
+            handle_tp(client, tg_token, tg_chat, symbol,
+                      tp_num    = 2,
+                      new_stop  = fval(data, "new_stop"),
+                      direction = direction,
+                      testnet   = testnet,
+                      ratio     = TP2_RATIO,
+                      pct_label = "%30")
+
         elif action == "tp3":
-            handle_tp3(client, tg_token, tg_chat, symbol,
-                       new_stop=fval(data, "new_stop"), testnet=testnet)
-        elif action == "trail_update":
-            handle_trail_update(client, tg_token, tg_chat, symbol,
-                                new_stop=fval(data, "new_stop"))
+            handle_tp(client, tg_token, tg_chat, symbol,
+                      tp_num    = 3,
+                      new_stop  = fval(data, "new_stop"),
+                      direction = direction,
+                      testnet   = testnet,
+                      ratio     = TP3_RATIO,
+                      pct_label = "%25")
+
         elif action == "stop":
-            handle_stop(client, tg_token, tg_chat, symbol)
+            handle_stop(client, tg_token, tg_chat, symbol, direction)
+
+        elif action == "trail":
+            log.info(f"Trail bilgi: {symbol} {direction} @ {fval(data, 'new_stop')}")
+
         else:
             return jsonify({"error": f"Bilinmeyen action: {action}"}), 400
 
-        return jsonify({"status": "ok", "action": action, "symbol": symbol}), 200
+        return jsonify({
+            "status"   : "ok",
+            "action"   : action,
+            "direction": direction,
+            "symbol"   : symbol
+        }), 200
 
     except Exception as e:
         err_str = str(e)
         if "-1121" in err_str:
-            log.warning(f"Geçersiz sembol, atlandı: {err_str[:80]}")
+            log.warning(f"Geçersiz sembol atlandı: {err_str[:80]}")
             return jsonify({"status": "skipped", "reason": "invalid_symbol"}), 200
         log.error(f"Webhook hatası: {e}")
         return jsonify({"error": err_str}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "running", "mode": "LONG", "hedge": True, "platform": "heroku"}), 200
+    return jsonify({
+        "status"  : "running",
+        "mode"    : "LONG+SHORT",
+        "hedge"   : True,
+        "platform": "heroku"
+    }), 200
 
 if __name__ == "__main__":
-    log.info(f"LONG Bot başlatıldı | Port: {PORT} | Hedge Mode: ON")
+    log.info(f"Long+Short Bot başlatıldı | Port: {PORT} | Hedge Mode: ON")
     app.run(host="0.0.0.0", port=PORT, debug=False)
