@@ -343,6 +343,8 @@ def open_position(client, token, chat, testnet, api_key,
 
         if testnet:
             log.info(f"[TESTNET] TP emirleri atlandı: {symbol}")
+            if stop > 0:
+                log.info(f"[TESTNET] STOP atlandı: {symbol} @ {stop}")
         else:
             # ── TP emirleri ───────────────────────────────────
             for tp_price, tp_qty, tp_name in [
@@ -378,9 +380,6 @@ def open_position(client, token, chat, testnet, api_key,
                     )
                 except Exception as e:
                     log.error(f"İlk STOP emri [{symbol} {direction}]: {e}")
-
-        elif stop > 0 and testnet:
-            log.info(f"[TESTNET] STOP atlandı: {symbol} @ {stop}")
 
         tg(token, chat,
            f"{emoji} <b>{symbol} {direction} AÇILDI</b> [Hedge Mode]\n"
