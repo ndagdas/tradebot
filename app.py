@@ -252,8 +252,7 @@ def market_close_ratio(client: UMFutures, symbol: str,
         client.new_order(
             symbol=symbol, side=close_side,
             type="MARKET", quantity=qty,
-            reduceOnly="true",
-            positionSide=direction
+            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
         )
         log.info(f"{direction} kısmi kapat: {symbol} {qty} lot ({ratio*100:.0f}%)")
         return qty
@@ -294,8 +293,7 @@ def update_stop_order(client: UMFutures, symbol: str,
             stopPrice=round(new_stop, pp),
             quantity=qty,
             timeInForce="GTE_GTC",
-            reduceOnly="true",
-            positionSide=direction
+            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
         )
         log.info(f"Yeni {direction} STOP: {symbol} @ {round(new_stop, pp)}")
     except Exception as e:
@@ -378,8 +376,7 @@ def open_position(client, token, chat, testnet, api_key,
                             stopPrice=round(tp_price, pp),
                             quantity=tp_qty,
                             timeInForce="GTE_GTC",
-                            reduceOnly="true",
-                            positionSide=direction
+                            positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
                         )
                     except Exception as e:
                         log.error(f"{tp_name} emri [{symbol} {direction}]: {e}")
@@ -393,8 +390,7 @@ def open_position(client, token, chat, testnet, api_key,
                         stopPrice=round(stop, pp),
                         quantity=qty,
                         timeInForce="GTE_GTC",
-                        reduceOnly="true",
-                        positionSide=direction
+                        positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
                     )
                 except Exception as e:
                     log.error(f"İlk STOP emri [{symbol} {direction}]: {e}")
@@ -469,8 +465,7 @@ def handle_stop(client, token, chat, symbol, direction: str):
             client.new_order(
                 symbol=symbol, side=close_side,
                 type="MARKET", quantity=qty,
-                reduceOnly="true",
-                positionSide=direction
+                positionSide=direction   # reduceOnly: Hedge Mode'da positionSide yeterli
             )
             log.info(f"{direction} STOP: {symbol} {qty} lot kapatıldı")
     except Exception as e:
