@@ -191,14 +191,32 @@ def mark_price(client: UMFutures, symbol: str) -> float:
 # ── Pozisyon Sorgula ────────────────────────────────────────
 def get_position(client: UMFutures, symbol: str, direction: str):
     """
-    Hedge Mode'da verilen yöndeki açık pozisyonu döndürür.
-    direction: "LONG" veya "SHORT"
-    positionAmt: her iki yönde de pozitif gelir.
+    Hedge Mode ve One-Way/Testnet uyumlu pozisyon sorgusu.
+
+    Hedge Mode:
+        positionSide = "LONG" veya "SHORT"
+        positionAmt  = her iki yönde pozitif
+
+    One-Way / Testnet fallback:
+        positionSide = "BOTH"
+        LONG  → positionAmt > 0
+        SHORT → positionAmt < 0
     """
     for p in client.get_position_risk(symbol=symbol):
-        if (p.get("positionSide") == direction and
-                float(p.get("positionAmt", 0)) > 0):
+        pos_side = p.get("positionSide", "BOTH")
+        amt      = float(p.get("positionAmt", 0))
+
+        # Hedge Mode
+        if pos_side == direction and abs(amt) > 0:
             return p
+
+        # One-Way / Testnet fallback
+        if pos_side == "BOTH":
+            if direction == "LONG"  and amt > 0:
+                return p
+            if direction == "SHORT" and amt < 0:
+                return p
+
     return None
 
 # ── Lot Yardımcısı ──────────────────────────────────────────
@@ -223,7 +241,7 @@ def market_close_ratio(client: UMFutures, symbol: str,
         log.info(f"Kapatma atlandı: {symbol} {direction} pozisyon yok")
         return 0.0
 
-    total = float(pos["positionAmt"])
+    total = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif gelebilir
     qty   = safe_qty(total * ratio, info)
     if qty <= 0:
         log.warning(f"Kapatma qty küçük: {symbol} qty={qty}")
@@ -268,7 +286,7 @@ def update_stop_order(client: UMFutures, symbol: str,
 
     try:
         pp         = info["prc"]
-        qty        = float(pos["positionAmt"])
+        qty        = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif
         close_side = "SELL" if direction == "LONG" else "BUY"
 
         client.new_order(
@@ -447,7 +465,7 @@ def handle_stop(client, token, chat, symbol, direction: str):
     try:
         pos = get_position(client, symbol, direction)
         if pos:
-            qty = float(pos["positionAmt"])
+            qty = abs(float(pos["positionAmt"]))   # SHORT testnet'te negatif
             client.new_order(
                 symbol=symbol, side=close_side,
                 type="MARKET", quantity=qty,
